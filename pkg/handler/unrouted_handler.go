@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -490,6 +491,7 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
 	}
 
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Upload-Offset", strconv.FormatInt(info.Offset, 10))
 	handler.sendResp(w, r, http.StatusOK)
@@ -758,7 +760,7 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Set headers before sending responses
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Offset, 10))
+	w.Header().Set("Accept-Ranges", "bytes")
 
 	contentType, contentDisposition := filterContentType(info)
 	w.Header().Set("Content-Type", contentType)
@@ -776,8 +778,62 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	handler.sendResp(w, r, http.StatusOK)
-	io.Copy(w, src)
+	// Check if the request contains a range header
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		ranges, err := parseRange(rangeHeader, info.Offset)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		// Check if there is more than one range specified
+		if len(ranges) > 1 {
+			// Multiple ranges are not supported, respond with "416 Range Not Satisfiable" status
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Offset))
+			handler.sendResp(w, r, http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		// Process the single range
+		rangeStart := ranges[0].start
+		rangeEnd := rangeStart + ranges[0].length - 1
+		rangeSize := ranges[0].length
+
+		if rangeStart < 0 || rangeEnd >= info.Offset {
+			// Invalid range, respond with "416 Range Not Satisfiable" status
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Offset))
+			handler.sendResp(w, r, http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		// Set the appropriate headers for the range response
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, info.Offset))
+		w.Header().Set("Content-Length", strconv.FormatInt(rangeSize, 10))
+
+		// Send "206 Partial Content" status indicating a successful range request
+		handler.sendResp(w, r, http.StatusPartialContent)
+
+		if rangeStart > 0 {
+			// Discard content until we reach the starting point of the range
+			io.CopyN(io.Discard, src, rangeStart-1)
+		}
+
+		// Copy the range to the response writer
+		io.CopyN(w, src, rangeSize)
+	} else {
+		// No range requested, send the entire file
+
+		// Set headers before sending responses
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Offset, 10))
+
+		// Send "200 OK" status indicating a successful full file response
+		handler.sendResp(w, r, http.StatusOK)
+
+		// Copy the entire file to the response writer
+		io.Copy(w, src)
+
+	}
 
 	// Try to close the reader if the io.Closer interface is implemented
 	if closer, ok := src.(io.Closer); ok {
